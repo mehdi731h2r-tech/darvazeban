@@ -107,17 +107,42 @@ class GatekeeperApp:
         top.pack(fill="x")
         self.title_label(top, "🚪 دروازه‌بان", 20).pack()
 
+        # --- جستجوی سریع کارمند ---
+        search_frame = tk.Frame(self.root, bg="#1e1e2f", padx=15)
+        search_frame.pack(fill="x", pady=(0, 6))
+
+        tk.Label(search_frame, text="🔎 جستجوی سریع:", bg="#1e1e2f", fg="#90caf9", font=("Tahoma", 11)).pack(side="right", padx=(0, 8))
+        self.quick_search = tk.Entry(search_frame, font=("Tahoma", 12), justify="right")
+        self.quick_search.pack(side="right", fill="x", expand=True, ipady=6)
+        self.quick_search.bind("<KeyRelease>", self._on_quick_search)
+        self.quick_search.bind("<Down>", lambda e: self._focus_suggest())
+        self.quick_search.bind("<Return>", lambda e: self._select_first_suggest())
+
+        # لیست پیشنهادات
+        self.suggest_frame = tk.Frame(self.root, bg="#2a2a3d")
+        self.suggest_list = tk.Listbox(self.suggest_frame, font=("Tahoma", 11), height=5, justify="right",
+                                       bg="#2a2a3d", fg="white", selectbackground="#4CAF50", activestyle="none")
+        self.suggest_list.pack(fill="x", padx=15)
+        self.suggest_list.bind("<Double-Button-1>", lambda e: self._apply_suggestion())
+        self.suggest_list.bind("<Return>", lambda e: self._apply_suggestion())
+        self.suggest_frame.pack_forget()  # مخفی در ابتدا
+
         # ورودی پلاک به صورت ۴ فیلد مطابق پلاک ایرانی
         entry_frame = tk.Frame(self.root, bg="#1e1e2f", padx=15)
         entry_frame.pack(fill="x")
+        self._entry_frame = entry_frame
 
         plate_inputs = tk.Frame(entry_frame, bg="#1e1e2f")
         plate_inputs.pack(side="right", fill="x", expand=True, padx=(0, 8))
 
         # ترتیب از راست به چپ: ۲ رقم | حرف | ۳ رقم | ۲ رقم  (مثل عکس پلاک)
-        # فیلد چهارم (۲ رقم سمت راست پلاک)
-        self.plate_part4 = tk.Entry(plate_inputs, font=("Tahoma", 16), justify="center", width=3)
-        self.plate_part4.pack(side="right", ipady=8, padx=3)
+        # فیلد چهارم (۲ رقم سمت راست پلاک) + برچسب ایران
+        part4_frame = tk.Frame(plate_inputs, bg="#1e1e2f")
+        part4_frame.pack(side="right", padx=3)
+        tk.Label(part4_frame, text="ایران", bg="#1e1e2f", fg="#90caf9", font=("Tahoma", 9)).pack()
+        self.plate_part4 = tk.Entry(part4_frame, font=("Tahoma", 16), justify="center", width=3)
+        self.plate_part4.pack(ipady=8)
+
         tk.Label(plate_inputs, text="-", bg="#1e1e2f", fg="#888", font=("Tahoma", 14)).pack(side="right")
 
         # فیلد سوم (۳ رقم)
@@ -136,6 +161,12 @@ class GatekeeperApp:
 
         self.button(entry_frame, "✅ بررسی پلاک", self.check_plate).pack(side="left")
 
+        # پر شدن خودکار فیلدها
+        self.plate_part1.bind("<KeyRelease>", lambda e: self._auto_next(self.plate_part1, 2, self.plate_part2))
+        self.plate_part2.bind("<KeyRelease>", lambda e: self._auto_next(self.plate_part2, 1, self.plate_part3))
+        self.plate_part3.bind("<KeyRelease>", lambda e: self._auto_next(self.plate_part3, 3, self.plate_part4))
+        self.plate_part4.bind("<KeyRelease>", lambda e: self._limit_length(self.plate_part4, 2))
+
         # اتصال کلید Enter به بررسی
         for entry in (self.plate_part1, self.plate_part2, self.plate_part3, self.plate_part4):
             entry.bind("<Return>", lambda event: self.check_plate())
@@ -148,6 +179,7 @@ class GatekeeperApp:
         self.button(nav, "🔄 تحویل / دریافت شیفت", self.show_shifts, "#ff9800").pack(side="right", padx=3)
         self.button(nav, "👥 مدیریت کارمندان", self.show_employees, "#607d8b").pack(side="right", padx=3)
         self.button(nav, "🔍 جستجوی پیشرفته", self.show_search, "#607d8b").pack(side="right", padx=3)
+        self.button(nav, "👤 مهمان", self.show_guest, "#9c27b0").pack(side="right", padx=3)
         self.button(nav, "خروج", self.logout, "#f44336").pack(side="left", padx=3)
 
         self.result_label = tk.Label(self.root, text="", justify="right", anchor="e", bg="#2a2a3d", fg="white",
@@ -195,6 +227,96 @@ class GatekeeperApp:
             self.recent_tree.delete(item)
         for log in reversed(self.logs[-12:]):
             self.recent_tree.insert("", "end", values=(self.format_time(log["time"]), self.format_plate(log["plate"]), log["name"], log["type"], log["action"]))
+
+    def _auto_next(self, current, max_len, next_widget):
+        """بعد از پر شدن فیلد، فوکوس به فیلد بعدی برود"""
+        text = current.get()
+        if len(text) > max_len:
+            current.delete(max_len, "end")
+            text = current.get()
+        if len(text) >= max_len:
+            next_widget.focus_set()
+
+    def _limit_length(self, entry, max_len):
+        """محدود کردن طول فیلد آخر"""
+        text = entry.get()
+        if len(text) > max_len:
+            entry.delete(max_len, "end")
+
+    def _on_quick_search(self, event=None):
+        """جستجوی زنده و نمایش پیشنهادات"""
+        q = self.quick_search.get().strip().casefold()
+        self.suggest_list.delete(0, "end")
+        self._suggest_data = []
+
+        if not q:
+            self.suggest_frame.pack_forget()
+            return
+
+        matches = []
+        for emp in self.employees:
+            text = " ".join([
+                emp.get("plate", ""),
+                emp.get("name", ""),
+                emp.get("unit", ""),
+                emp.get("car", "")
+            ]).casefold()
+            if q in text:
+                matches.append(emp)
+
+        if not matches:
+            self.suggest_frame.pack_forget()
+            return
+
+        # نمایش حداکثر ۸ مورد
+        for emp in matches[:8]:
+            display = f"{self.format_plate(emp['plate'])}  |  {emp['name']}  |  {emp.get('unit', '')}"
+            if emp.get("car"):
+                display += f"  |  {emp['car']}"
+            self.suggest_list.insert("end", display)
+            self._suggest_data.append(emp)
+
+        try:
+            self.suggest_frame.pack(fill="x", before=self._entry_frame)
+        except Exception:
+            self.suggest_frame.pack(fill="x")
+
+    def _focus_suggest(self, event=None):
+        if self.suggest_list.size() > 0:
+            self.suggest_list.focus_set()
+            self.suggest_list.selection_set(0)
+            self.suggest_list.activate(0)
+
+    def _select_first_suggest(self, event=None):
+        if self.suggest_list.size() > 0:
+            self.suggest_list.selection_set(0)
+            self._apply_suggestion()
+
+    def _apply_suggestion(self, event=None):
+        """با انتخاب پیشنهاد، فیلدهای پلاک پر شوند"""
+        sel = self.suggest_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if not hasattr(self, "_suggest_data") or idx >= len(self._suggest_data):
+            return
+
+        emp = self._suggest_data[idx]
+        plate = emp.get("plate", "")
+        p = plate.replace(" ", "").replace("-", "")
+
+        self.clear_plate_fields()
+        if len(p) >= 8:
+            self.plate_part1.insert(0, p[0:2])
+            self.plate_part2.insert(0, p[2:3])
+            self.plate_part3.insert(0, p[3:6])
+            self.plate_part4.insert(0, p[6:8])
+        else:
+            self.plate_part1.insert(0, p)
+
+        self.quick_search.delete(0, "end")
+        self.suggest_frame.pack_forget()
+        self.plate_part4.focus_set()
 
     def get_plate_string(self):
         """ترکیب چهار فیلد پلاک به یک رشته استاندارد"""
@@ -464,6 +586,69 @@ class GatekeeperApp:
 
         self.button(form, "ذخیره", save).pack(fill="x", pady=15)
         part1.focus_set()
+
+    def show_guest(self):
+        """ثبت مهمان با پلاک وارد شده در صفحه اصلی"""
+        p1 = self.plate_part1.get().strip()
+        p2 = self.plate_part2.get().strip()
+        p3 = self.plate_part3.get().strip()
+        p4 = self.plate_part4.get().strip()
+
+        if not (p1 and p2 and p3 and p4):
+            messagebox.showwarning(APP_NAME, "ابتدا پلاک را کامل وارد کنید.")
+            return
+        if len(p1) != 2 or not p1.isdigit() or len(p2) != 1 or len(p3) != 3 or not p3.isdigit() or len(p4) != 2 or not p4.isdigit():
+            messagebox.showwarning(APP_NAME, "پلاک را به درستی وارد کنید.")
+            return
+
+        plate = f"{p1}{p2}{p3}{p4}"
+        display_plate = f"{p1} {p2} {p3} {p4}"
+
+        win = self.new_window("ثبت مهمان", "480x420")
+        self.title_label(win, "👤 ثبت مهمان", 16).pack(pady=12)
+
+        form = tk.Frame(win, bg="#1e1e2f", padx=30)
+        form.pack(fill="both", expand=True)
+
+        tk.Label(form, text=f"پلاک: {display_plate}", bg="#1e1e2f", fg="#90caf9", font=("Tahoma", 13, "bold")).pack(anchor="e", pady=(0, 12))
+
+        tk.Label(form, text="فامیل", bg="#1e1e2f", fg="white", font=("Tahoma", 11)).pack(anchor="e")
+        family = tk.Entry(form, font=("Tahoma", 12), justify="right")
+        family.pack(fill="x", ipady=6, pady=4)
+
+        tk.Label(form, text="محل اعزام", bg="#1e1e2f", fg="white", font=("Tahoma", 11)).pack(anchor="e", pady=(10, 0))
+        place = tk.Entry(form, font=("Tahoma", 12), justify="right")
+        place.pack(fill="x", ipady=6, pady=4)
+
+        def save_guest(action):
+            fam = family.get().strip()
+            plc = place.get().strip()
+            if not fam:
+                messagebox.showwarning(APP_NAME, "فامیل را وارد کنید.")
+                return
+            if not plc:
+                messagebox.showwarning(APP_NAME, "محل اعزام را وارد کنید.")
+                return
+
+            name = f"{fam} (مهمان - {plc})"
+            now = datetime.now().isoformat(timespec="seconds")
+            log = {"time": now, "plate": plate, "name": name, "type": "مهمان", "action": action}
+            self.logs.append(log)
+            self.save_data()
+            self.refresh_recent_logs()
+
+            text = f"👤 مهمان ثبت شد\nفامیل: {fam}\nمحل اعزام: {plc}\nپلاک: {display_plate}\nاقدام: {action}"
+            self.result_label.config(text=text, bg="#6a1b9a")
+            self.clear_plate_fields()
+            win.destroy()
+            messagebox.showinfo(APP_NAME, f"مهمان با موفقیت ثبت شد ({action})")
+
+        btn_frame = tk.Frame(form, bg="#1e1e2f")
+        btn_frame.pack(fill="x", pady=20)
+        self.button(btn_frame, "✅ ورود", lambda: save_guest("ورود"), "#4CAF50").pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self.button(btn_frame, "🚪 خروج", lambda: save_guest("خروج"), "#f44336").pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        family.focus_set()
 
     def show_search(self):
         win = self.new_window("جستجوی پیشرفته", "900x580")
