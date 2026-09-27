@@ -2,13 +2,19 @@
 """دروازه‌بان: برنامه رومیزی ثبت ورود و خروج خودروها."""
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, ttk, simpledialog
 
 APP_NAME = "دروازه‌بان"
 DEFAULT_PASSWORD = "1234"
+
+# نام ماه‌های شمسی
+JALALI_MONTHS = [
+    "", "فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور",
+    "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند",
+]
 
 
 def app_directory():
@@ -20,18 +26,62 @@ def app_directory():
 DATA_FILE = app_directory() / "darvazeban_data.json"
 
 
+def gregorian_to_jalali(gy, gm, gd):
+    """تبدیل تاریخ میلادی به شمسی (بدون کتابخانه خارجی)"""
+    g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    gy2 = gy + 1 if gm > 2 else gy
+    days = (
+        355666
+        + (365 * gy)
+        + ((gy2 + 3) // 4)
+        - ((gy2 + 99) // 100)
+        + ((gy2 + 399) // 400)
+        + gd
+        + g_d_m[gm - 1]
+    )
+    jy = -1595 + (33 * (days // 12053))
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        jm = 1 + days // 31
+        jd = 1 + (days % 31)
+    else:
+        jm = 7 + (days - 186) // 30
+        jd = 1 + ((days - 186) % 30)
+    return jy, jm, jd
+
+
+def format_jalali_datetime(dt=None):
+    """تاریخ و ساعت شمسی به صورت خوانا"""
+    if dt is None:
+        dt = datetime.now()
+    jy, jm, jd = gregorian_to_jalali(dt.year, dt.month, dt.day)
+    return f"{jd:02d} {JALALI_MONTHS[jm]} {jy}  |  {dt.strftime('%H:%M:%S')}"
+
+
+def format_jalali_date(dt):
+    jy, jm, jd = gregorian_to_jalali(dt.year, dt.month, dt.day)
+    return f"{jy}/{jm:02d}/{jd:02d}"
+
+
 class GatekeeperApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("1000x700")
-        self.root.minsize(800, 550)
+        self.root.geometry("1050x720")
+        self.root.minsize(850, 580)
         self.root.configure(bg="#1e1e2f")
         self.employees = []
         self.logs = []
         self.shifts = []
         self.password = DEFAULT_PASSWORD
         self.selected_employee_index = None
+        self.admin_unlocked = False  # قفل بخش‌های حساس
+        self.clock_label = None
         self.load_data()
         self.configure_style()
         self.show_login()
@@ -67,6 +117,12 @@ class GatekeeperApp:
             messagebox.showerror(APP_NAME, f"خطا در ذخیره اطلاعات:\n{exc}")
 
     def clear_window(self):
+        if self.clock_label is not None:
+            try:
+                self.root.after_cancel(self._clock_job)
+            except Exception:
+                pass
+            self.clock_label = None
         for widget in self.root.winfo_children():
             widget.destroy()
 
@@ -74,15 +130,87 @@ class GatekeeperApp:
         return tk.Label(parent, text=text, bg="#1e1e2f", fg="white", font=("Tahoma", size, "bold"))
 
     def button(self, parent, text, command, color="#4CAF50"):
-        return tk.Button(parent, text=text, command=command, bg=color, fg="white", activebackground=color,
-                         activeforeground="white", font=("Tahoma", 11, "bold"), relief="flat", padx=10, pady=8,
-                         cursor="hand2")
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=color,
+            fg="white",
+            activebackground=color,
+            activeforeground="white",
+            font=("Tahoma", 11, "bold"),
+            relief="flat",
+            padx=10,
+            pady=8,
+            cursor="hand2",
+        )
 
+    # ---------- تقویم و ساعت شمسی ----------
+    def start_clock(self, label):
+        self.clock_label = label
+        self._update_clock()
+
+    def _update_clock(self):
+        if self.clock_label is None:
+            return
+        try:
+            self.clock_label.config(text=format_jalali_datetime())
+            self._clock_job = self.root.after(1000, self._update_clock)
+        except Exception:
+            pass
+
+    # ---------- قفل رمز ----------
+    def ask_password(self, title="تأیید هویت"):
+        """درخواست رمز برای بخش‌های حساس"""
+        pwd = simpledialog.askstring(title, "رمز عبور را وارد کنید:", show="*", parent=self.root)
+        if pwd is None:
+            return False
+        if pwd == self.password:
+            self.admin_unlocked = True
+            return True
+        messagebox.showerror(APP_NAME, "رمز عبور اشتباه است.")
+        return False
+
+    def require_admin(self, action_name="این عملیات"):
+        """اگر قفل باشد، رمز بپرسد"""
+        if self.admin_unlocked:
+            return True
+        return self.ask_password(f"قفل — {action_name}")
+
+    def change_password(self):
+        if not self.require_admin("تغییر رمز"):
+            return
+        new1 = simpledialog.askstring("رمز جدید", "رمز جدید را وارد کنید:", show="*", parent=self.root)
+        if not new1:
+            return
+        new2 = simpledialog.askstring("تأیید رمز", "رمز جدید را دوباره وارد کنید:", show="*", parent=self.root)
+        if new1 != new2:
+            messagebox.showwarning(APP_NAME, "رمزها یکسان نیستند.")
+            return
+        if len(new1) < 4:
+            messagebox.showwarning(APP_NAME, "رمز باید حداقل ۴ کاراکتر باشد.")
+            return
+        self.password = new1
+        self.save_data()
+        messagebox.showinfo(APP_NAME, "رمز با موفقیت تغییر کرد.")
+
+    def lock_admin(self):
+        self.admin_unlocked = False
+        messagebox.showinfo(APP_NAME, "بخش‌های حساس قفل شد.")
+
+    # ---------- ورود ----------
     def show_login(self):
         self.clear_window()
+        self.admin_unlocked = False
         frame = tk.Frame(self.root, bg="#1e1e2f", padx=60, pady=70)
         frame.place(relx=0.5, rely=0.5, anchor="center")
-        self.title_label(frame, "🚪 دروازه‌بان", 24).pack(pady=(0, 16))
+        self.title_label(frame, "🚪 دروازه‌بان", 24).pack(pady=(0, 8))
+
+        # ساعت شمسی در صفحه ورود
+        clock = tk.Label(frame, text="", bg="#1e1e2f", fg="#90caf9", font=("Tahoma", 12))
+        clock.pack(pady=(0, 16))
+        self.start_clock(clock)
+
         tk.Label(frame, text="رمز عبور را وارد کنید", bg="#1e1e2f", fg="white", font=("Tahoma", 12)).pack()
         self.password_entry = tk.Entry(frame, show="*", font=("Tahoma", 14), justify="center", width=26)
         self.password_entry.pack(pady=14, ipady=7)
@@ -94,40 +222,57 @@ class GatekeeperApp:
 
     def login(self):
         if self.password_entry.get() == self.password:
+            self.admin_unlocked = False
             self.show_main()
         else:
             self.login_error.config(text="رمز عبور اشتباه است")
 
     def logout(self):
+        self.admin_unlocked = False
         self.show_login()
 
+    # ---------- صفحه اصلی ----------
     def show_main(self):
         self.clear_window()
-        top = tk.Frame(self.root, bg="#1e1e2f", padx=15, pady=12)
+        top = tk.Frame(self.root, bg="#1e1e2f", padx=15, pady=8)
         top.pack(fill="x")
-        self.title_label(top, "🚪 دروازه‌بان", 20).pack()
+        self.title_label(top, "🚪 دروازه‌بان", 18).pack(side="right")
+
+        # ساعت و تاریخ شمسی (مستقل از تنظیمات نمایش سیستم)
+        clock = tk.Label(top, text="", bg="#1e1e2f", fg="#90caf9", font=("Tahoma", 12, "bold"))
+        clock.pack(side="left")
+        self.start_clock(clock)
 
         # --- جستجوی سریع کارمند ---
         search_frame = tk.Frame(self.root, bg="#1e1e2f", padx=15)
         search_frame.pack(fill="x", pady=(0, 6))
 
-        tk.Label(search_frame, text="🔎 جستجوی سریع:", bg="#1e1e2f", fg="#90caf9", font=("Tahoma", 11)).pack(side="right", padx=(0, 8))
+        tk.Label(search_frame, text="🔎 جستجوی سریع:", bg="#1e1e2f", fg="#90caf9", font=("Tahoma", 11)).pack(
+            side="right", padx=(0, 8)
+        )
         self.quick_search = tk.Entry(search_frame, font=("Tahoma", 12), justify="right")
         self.quick_search.pack(side="right", fill="x", expand=True, ipady=6)
         self.quick_search.bind("<KeyRelease>", self._on_quick_search)
         self.quick_search.bind("<Down>", lambda e: self._focus_suggest())
         self.quick_search.bind("<Return>", lambda e: self._select_first_suggest())
 
-        # لیست پیشنهادات
         self.suggest_frame = tk.Frame(self.root, bg="#2a2a3d")
-        self.suggest_list = tk.Listbox(self.suggest_frame, font=("Tahoma", 11), height=5, justify="right",
-                                       bg="#2a2a3d", fg="white", selectbackground="#4CAF50", activestyle="none")
+        self.suggest_list = tk.Listbox(
+            self.suggest_frame,
+            font=("Tahoma", 11),
+            height=5,
+            justify="right",
+            bg="#2a2a3d",
+            fg="white",
+            selectbackground="#4CAF50",
+            activestyle="none",
+        )
         self.suggest_list.pack(fill="x", padx=15)
         self.suggest_list.bind("<Double-Button-1>", lambda e: self._apply_suggestion())
         self.suggest_list.bind("<Return>", lambda e: self._apply_suggestion())
-        self.suggest_frame.pack_forget()  # مخفی در ابتدا
+        self.suggest_frame.pack_forget()
 
-        # ورودی پلاک به صورت ۴ فیلد مطابق پلاک ایرانی
+        # ورودی پلاک ۴ فیلدی
         entry_frame = tk.Frame(self.root, bg="#1e1e2f", padx=15)
         entry_frame.pack(fill="x")
         self._entry_frame = entry_frame
@@ -135,8 +280,6 @@ class GatekeeperApp:
         plate_inputs = tk.Frame(entry_frame, bg="#1e1e2f")
         plate_inputs.pack(side="right", fill="x", expand=True, padx=(0, 8))
 
-        # ترتیب از راست به چپ: ۲ رقم | حرف | ۳ رقم | ۲ رقم  (مثل عکس پلاک)
-        # فیلد چهارم (۲ رقم سمت راست پلاک) + برچسب ایران
         part4_frame = tk.Frame(plate_inputs, bg="#1e1e2f")
         part4_frame.pack(side="right", padx=3)
         tk.Label(part4_frame, text="ایران", bg="#1e1e2f", fg="#90caf9", font=("Tahoma", 9)).pack()
@@ -145,52 +288,68 @@ class GatekeeperApp:
 
         tk.Label(plate_inputs, text="-", bg="#1e1e2f", fg="#888", font=("Tahoma", 14)).pack(side="right")
 
-        # فیلد سوم (۳ رقم)
         self.plate_part3 = tk.Entry(plate_inputs, font=("Tahoma", 16), justify="center", width=4)
         self.plate_part3.pack(side="right", ipady=8, padx=3)
         tk.Label(plate_inputs, text="-", bg="#1e1e2f", fg="#888", font=("Tahoma", 14)).pack(side="right")
 
-        # فیلد دوم (حرف)
         self.plate_part2 = tk.Entry(plate_inputs, font=("Tahoma", 16), justify="center", width=3)
         self.plate_part2.pack(side="right", ipady=8, padx=3)
         tk.Label(plate_inputs, text="-", bg="#1e1e2f", fg="#888", font=("Tahoma", 14)).pack(side="right")
 
-        # فیلد اول (۲ رقم سمت چپ)
         self.plate_part1 = tk.Entry(plate_inputs, font=("Tahoma", 16), justify="center", width=3)
         self.plate_part1.pack(side="right", ipady=8, padx=3)
 
         self.button(entry_frame, "✅ بررسی پلاک", self.check_plate).pack(side="left")
 
-        # پر شدن خودکار فیلدها
         self.plate_part1.bind("<KeyRelease>", lambda e: self._auto_next(self.plate_part1, 2, self.plate_part2))
         self.plate_part2.bind("<KeyRelease>", lambda e: self._auto_next(self.plate_part2, 1, self.plate_part3))
         self.plate_part3.bind("<KeyRelease>", lambda e: self._auto_next(self.plate_part3, 3, self.plate_part4))
         self.plate_part4.bind("<KeyRelease>", lambda e: self._limit_length(self.plate_part4, 2))
 
-        # اتصال کلید Enter به بررسی
         for entry in (self.plate_part1, self.plate_part2, self.plate_part3, self.plate_part4):
             entry.bind("<Return>", lambda event: self.check_plate())
 
         self.plate_part1.focus_set()
 
+        # نوار دکمه‌ها
         nav = tk.Frame(self.root, bg="#1e1e2f", padx=15, pady=10)
         nav.pack(fill="x")
-        self.button(nav, "📊 گزارش روزانه", self.show_report, "#2196F3").pack(side="right", padx=3)
+        self.button(nav, "📊 گزارش‌ها", self.show_report, "#2196F3").pack(side="right", padx=3)
         self.button(nav, "🔄 تحویل / دریافت شیفت", self.show_shifts, "#ff9800").pack(side="right", padx=3)
-        self.button(nav, "👥 مدیریت کارمندان", self.show_employees, "#607d8b").pack(side="right", padx=3)
+        self.button(nav, "👥 مدیریت کارمندان", self._open_employees_locked, "#607d8b").pack(side="right", padx=3)
         self.button(nav, "🔍 جستجوی پیشرفته", self.show_search, "#607d8b").pack(side="right", padx=3)
         self.button(nav, "👤 مهمان", self.show_guest, "#9c27b0").pack(side="right", padx=3)
+        self.button(nav, "🔐 تغییر رمز", self.change_password, "#795548").pack(side="right", padx=3)
+        self.button(nav, "🔒 قفل", self.lock_admin, "#455a64").pack(side="right", padx=3)
         self.button(nav, "خروج", self.logout, "#f44336").pack(side="left", padx=3)
 
-        self.result_label = tk.Label(self.root, text="", justify="right", anchor="e", bg="#2a2a3d", fg="white",
-                                     font=("Tahoma", 13), padx=18, pady=15, height=5)
+        self.result_label = tk.Label(
+            self.root,
+            text="",
+            justify="right",
+            anchor="e",
+            bg="#2a2a3d",
+            fg="white",
+            font=("Tahoma", 13),
+            padx=18,
+            pady=15,
+            height=5,
+        )
         self.result_label.pack(fill="x", padx=15, pady=5)
 
-        tk.Label(self.root, text="📋 آخرین ورود/خروج‌ها", bg="#1e1e2f", fg="white", font=("Tahoma", 14, "bold")).pack(pady=(10, 3))
+        tk.Label(
+            self.root, text="📋 آخرین ورود/خروج‌ها", bg="#1e1e2f", fg="white", font=("Tahoma", 14, "bold")
+        ).pack(pady=(10, 3))
         log_frame = tk.Frame(self.root, bg="#1e1e2f", padx=15, pady=8)
         log_frame.pack(fill="both", expand=True)
-        self.recent_tree = self.make_tree(log_frame, ("زمان", "پلاک", "نام", "نوع", "اقدام"), (150, 150, 230, 120, 100))
+        self.recent_tree = self.make_tree(
+            log_frame, ("زمان", "پلاک", "نام", "نوع", "اقدام"), (180, 150, 230, 120, 100)
+        )
         self.refresh_recent_logs()
+
+    def _open_employees_locked(self):
+        if self.require_admin("مدیریت کارمندان"):
+            self.show_employees()
 
     def make_tree(self, parent, columns, widths):
         frame = tk.Frame(parent)
@@ -207,12 +366,12 @@ class GatekeeperApp:
 
     def format_time(self, value):
         try:
-            return datetime.fromisoformat(value).strftime("%Y/%m/%d - %H:%M:%S")
+            dt = datetime.fromisoformat(value)
+            return f"{format_jalali_date(dt)} - {dt.strftime('%H:%M:%S')}"
         except (TypeError, ValueError):
             return value
 
     def format_plate(self, plate):
-        """نمایش زیبای پلاک با فاصله (مثل عکس)"""
         if not plate:
             return plate
         p = plate.replace(" ", "").replace("-", "")
@@ -226,10 +385,19 @@ class GatekeeperApp:
         for item in self.recent_tree.get_children():
             self.recent_tree.delete(item)
         for log in reversed(self.logs[-12:]):
-            self.recent_tree.insert("", "end", values=(self.format_time(log["time"]), self.format_plate(log["plate"]), log["name"], log["type"], log["action"]))
+            self.recent_tree.insert(
+                "",
+                "end",
+                values=(
+                    self.format_time(log["time"]),
+                    self.format_plate(log["plate"]),
+                    log["name"],
+                    log["type"],
+                    log["action"],
+                ),
+            )
 
     def _auto_next(self, current, max_len, next_widget):
-        """بعد از پر شدن فیلد، فوکوس به فیلد بعدی برود"""
         text = current.get()
         if len(text) > max_len:
             current.delete(max_len, "end")
@@ -238,44 +406,33 @@ class GatekeeperApp:
             next_widget.focus_set()
 
     def _limit_length(self, entry, max_len):
-        """محدود کردن طول فیلد آخر"""
         text = entry.get()
         if len(text) > max_len:
             entry.delete(max_len, "end")
 
     def _on_quick_search(self, event=None):
-        """جستجوی زنده و نمایش پیشنهادات"""
         q = self.quick_search.get().strip().casefold()
         self.suggest_list.delete(0, "end")
         self._suggest_data = []
-
         if not q:
             self.suggest_frame.pack_forget()
             return
-
         matches = []
         for emp in self.employees:
-            text = " ".join([
-                emp.get("plate", ""),
-                emp.get("name", ""),
-                emp.get("unit", ""),
-                emp.get("car", "")
-            ]).casefold()
+            text = " ".join(
+                [emp.get("plate", ""), emp.get("name", ""), emp.get("unit", ""), emp.get("car", "")]
+            ).casefold()
             if q in text:
                 matches.append(emp)
-
         if not matches:
             self.suggest_frame.pack_forget()
             return
-
-        # نمایش حداکثر ۸ مورد
         for emp in matches[:8]:
             display = f"{self.format_plate(emp['plate'])}  |  {emp['name']}  |  {emp.get('unit', '')}"
             if emp.get("car"):
                 display += f"  |  {emp['car']}"
             self.suggest_list.insert("end", display)
             self._suggest_data.append(emp)
-
         try:
             self.suggest_frame.pack(fill="x", before=self._entry_frame)
         except Exception:
@@ -293,18 +450,15 @@ class GatekeeperApp:
             self._apply_suggestion()
 
     def _apply_suggestion(self, event=None):
-        """با انتخاب پیشنهاد، فیلدهای پلاک پر شوند"""
         sel = self.suggest_list.curselection()
         if not sel:
             return
         idx = sel[0]
         if not hasattr(self, "_suggest_data") or idx >= len(self._suggest_data):
             return
-
         emp = self._suggest_data[idx]
         plate = emp.get("plate", "")
         p = plate.replace(" ", "").replace("-", "")
-
         self.clear_plate_fields()
         if len(p) >= 8:
             self.plate_part1.insert(0, p[0:2])
@@ -313,13 +467,11 @@ class GatekeeperApp:
             self.plate_part4.insert(0, p[6:8])
         else:
             self.plate_part1.insert(0, p)
-
         self.quick_search.delete(0, "end")
         self.suggest_frame.pack_forget()
         self.plate_part4.focus_set()
 
     def get_plate_string(self):
-        """ترکیب چهار فیلد پلاک به یک رشته استاندارد"""
         p1 = self.plate_part1.get().strip()
         p2 = self.plate_part2.get().strip()
         p3 = self.plate_part3.get().strip()
@@ -340,8 +492,6 @@ class GatekeeperApp:
         if not (p1 and p2 and p3 and p4):
             messagebox.showwarning(APP_NAME, "لطفاً تمام بخش‌های پلاک را کامل وارد کنید.")
             return
-
-        # اعتبارسنجی ساده طول فیلدها
         if len(p1) != 2 or not p1.isdigit():
             messagebox.showwarning(APP_NAME, "فیلد اول باید دقیقاً ۲ رقم باشد.")
             self.plate_part1.focus_set()
@@ -359,15 +509,18 @@ class GatekeeperApp:
             self.plate_part4.focus_set()
             return
 
-        plate = self.get_plate_string()  # مثلاً: 11ب33411
-        display_plate = f"{p1} {p2} {p3} {p4}"  # برای نمایش زیبا: 11 ب 334 11
+        plate = self.get_plate_string()
+        display_plate = f"{p1} {p2} {p3} {p4}"
 
         is_entry = messagebox.askyesno("نوع حرکت", "این حرکت ورود است؟\n\nبله = ورود\nخیر = خروج")
         action = "ورود" if is_entry else "خروج"
         found = next((employee for employee in self.employees if employee["plate"] == plate), None)
         now = datetime.now().isoformat(timespec="seconds")
         if found:
-            text = f"✅ کارمند شرکت\nنام: {found['name']}\nواحد: {found['unit']}\nماشین: {found.get('car') or '—'}\nپلاک: {display_plate}\nاقدام: {action}\n\n🚪 در را باز کنید"
+            text = (
+                f"✅ کارمند شرکت\nنام: {found['name']}\nواحد: {found['unit']}\n"
+                f"ماشین: {found.get('car') or '—'}\nپلاک: {display_plate}\nاقدام: {action}\n\n🚪 در را باز کنید"
+            )
             self.result_label.config(text=text, bg="#2e7d32")
             log = {"time": now, "plate": plate, "name": found["name"], "type": "کارمند", "action": action}
         else:
@@ -387,37 +540,136 @@ class GatekeeperApp:
         win.transient(self.root)
         return win
 
+    # ---------- گزارش روزانه / ماهانه / سه‌ماهه ----------
+    def _filter_logs(self, period):
+        """period: day | month | quarter"""
+        now = datetime.now()
+        filtered = []
+        for log in self.logs:
+            try:
+                dt = datetime.fromisoformat(log["time"])
+            except (TypeError, ValueError):
+                continue
+            if period == "day":
+                if dt.date() == now.date():
+                    filtered.append(log)
+            elif period == "month":
+                if dt.year == now.year and dt.month == now.month:
+                    filtered.append(log)
+            elif period == "quarter":
+                q = (now.month - 1) // 3
+                if dt.year == now.year and (dt.month - 1) // 3 == q:
+                    filtered.append(log)
+        return filtered
+
     def show_report(self):
-        win = self.new_window("گزارش روزانه", "950x620")
-        self.title_label(win, "📊 گزارش روزانه", 18).pack(pady=12)
-        today = datetime.now().date()
-        today_logs = [log for log in self.logs if datetime.fromisoformat(log["time"]).date() == today]
-        emp_in = sum(log["type"] == "کارمند" and log["action"] == "ورود" for log in today_logs)
-        emp_out = sum(log["type"] == "کارمند" and log["action"] == "خروج" for log in today_logs)
-        strangers = sum(log["type"] == "غریبه" for log in today_logs)
-        tk.Label(win, text=f"تاریخ: {today.strftime('%Y/%m/%d')}     |     کارمند ورود: {emp_in}     |     کارمند خروج: {emp_out}     |     غریبه‌ها: {strangers}", bg="#1e1e2f", fg="white", font=("Tahoma", 11)).pack(pady=5)
-        frame = tk.Frame(win, bg="#1e1e2f", padx=15, pady=10)
+        win = self.new_window("گزارش‌ها", "980x650")
+        self.title_label(win, "📊 گزارش ورود و خروج", 18).pack(pady=10)
+
+        period_var = tk.StringVar(value="day")
+        period_frame = tk.Frame(win, bg="#1e1e2f")
+        period_frame.pack(pady=5)
+        for text, val in (("روزانه", "day"), ("ماهانه", "month"), ("سه‌ماهه", "quarter")):
+            tk.Radiobutton(
+                period_frame,
+                text=text,
+                variable=period_var,
+                value=val,
+                bg="#1e1e2f",
+                fg="white",
+                selectcolor="#333",
+                activebackground="#1e1e2f",
+                activeforeground="white",
+                font=("Tahoma", 11),
+                command=lambda: refresh(),
+            ).pack(side="right", padx=12)
+
+        summary_label = tk.Label(win, text="", bg="#1e1e2f", fg="white", font=("Tahoma", 11))
+        summary_label.pack(pady=5)
+
+        frame = tk.Frame(win, bg="#1e1e2f", padx=15, pady=8)
         frame.pack(fill="both", expand=True)
         tree = self.make_tree(frame, ("زمان", "پلاک", "نام", "نوع", "اقدام"), (180, 140, 210, 120, 100))
-        for log in reversed(today_logs):
-            tree.insert("", "end", values=(self.format_time(log["time"]), self.format_plate(log["plate"]), log["name"], log["type"], log["action"]))
-        self.button(win, "📤 کپی گزارش", lambda: self.copy_report(today_logs, today), "#2196F3").pack(pady=10)
 
-    def copy_report(self, today_logs, today):
-        lines = [f"گزارش روزانه - {today.strftime('%Y/%m/%d')}", ""]
-        lines += [f"{self.format_time(log['time'])} - {self.format_plate(log['plate'])} - {log['name']} ({log['type']} - {log['action']})" for log in today_logs]
-        self.root.clipboard_clear()
-        self.root.clipboard_append("\n".join(lines))
-        self.root.update()
-        messagebox.showinfo(APP_NAME, "گزارش در حافظه موقت کپی شد.")
+        def refresh():
+            period = period_var.get()
+            logs = self._filter_logs(period)
+            for item in tree.get_children():
+                tree.delete(item)
+            for log in reversed(logs):
+                tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        self.format_time(log["time"]),
+                        self.format_plate(log["plate"]),
+                        log["name"],
+                        log["type"],
+                        log["action"],
+                    ),
+                )
+            emp_in = sum(1 for log in logs if log["type"] == "کارمند" and log["action"] == "ورود")
+            emp_out = sum(1 for log in logs if log["type"] == "کارمند" and log["action"] == "خروج")
+            guests = sum(1 for log in logs if log["type"] == "مهمان")
+            strangers = sum(1 for log in logs if log["type"] == "غریبه")
+            period_name = {"day": "روزانه", "month": "ماهانه", "quarter": "سه‌ماهه"}[period]
+            summary_label.config(
+                text=(
+                    f"دوره: {period_name}  |  تاریخ شمسی: {format_jalali_date(datetime.now())}  |  "
+                    f"کارمند ورود: {emp_in}  |  کارمند خروج: {emp_out}  |  مهمان: {guests}  |  غریبه: {strangers}"
+                )
+            )
+            win._current_logs = logs
+            win._period_name = period_name
+
+        def copy_report():
+            logs = getattr(win, "_current_logs", [])
+            period_name = getattr(win, "_period_name", "")
+            lines = [f"گزارش {period_name} - {format_jalali_datetime()}", ""]
+            lines += [
+                f"{self.format_time(log['time'])} - {self.format_plate(log['plate'])} - "
+                f"{log['name']} ({log['type']} - {log['action']})"
+                for log in logs
+            ]
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(lines))
+            self.root.update()
+            messagebox.showinfo(APP_NAME, "گزارش در حافظه موقت کپی شد.")
+
+        def save_text():
+            logs = getattr(win, "_current_logs", [])
+            period_name = getattr(win, "_period_name", "")
+            lines = [f"گزارش {period_name} - {format_jalali_datetime()}", ""]
+            lines += [
+                f"{self.format_time(log['time'])} - {self.format_plate(log['plate'])} - "
+                f"{log['name']} ({log['type']} - {log['action']})"
+                for log in logs
+            ]
+            path = app_directory() / f"report_{period_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            try:
+                path.write_text("\n".join(lines), encoding="utf-8")
+                messagebox.showinfo(APP_NAME, f"گزارش ذخیره شد:\n{path}")
+            except OSError as exc:
+                messagebox.showerror(APP_NAME, f"خطا در ذخیره:\n{exc}")
+
+        btn_row = tk.Frame(win, bg="#1e1e2f")
+        btn_row.pack(pady=10)
+        self.button(btn_row, "📤 کپی گزارش", copy_report, "#2196F3").pack(side="right", padx=6)
+        self.button(btn_row, "💾 ذخیره فایل متنی", save_text, "#00897b").pack(side="right", padx=6)
+
+        refresh()
 
     def show_shifts(self):
+        if not self.require_admin("ثبت شیفت"):
+            return
         win = self.new_window("تحویل / دریافت شیفت")
         self.title_label(win, "🔄 تحویل / دریافت شیفت", 18).pack(pady=12)
         form = tk.Frame(win, bg="#1e1e2f", padx=25)
         form.pack(fill="x")
         tk.Label(form, text="نوع شیفت", bg="#1e1e2f", fg="white", font=("Tahoma", 11)).pack(anchor="e")
-        shift_type = ttk.Combobox(form, values=["دریافت", "تحویل"], state="readonly", font=("Tahoma", 11), justify="right")
+        shift_type = ttk.Combobox(
+            form, values=["دریافت", "تحویل"], state="readonly", font=("Tahoma", 11), justify="right"
+        )
         shift_type.set("دریافت")
         shift_type.pack(fill="x", pady=4)
         tk.Label(form, text="نام نگهبان", bg="#1e1e2f", fg="white", font=("Tahoma", 11)).pack(anchor="e")
@@ -434,14 +686,30 @@ class GatekeeperApp:
             for item in tree.get_children():
                 tree.delete(item)
             for shift in reversed(self.shifts[-20:]):
-                tree.insert("", "end", values=(self.format_time(shift["time"]), shift["type"], shift["name"], shift.get("note", "")))
+                tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        self.format_time(shift["time"]),
+                        shift["type"],
+                        shift["name"],
+                        shift.get("note", ""),
+                    ),
+                )
 
         def save_shift():
             guard = name.get().strip()
             if not guard:
                 messagebox.showwarning(APP_NAME, "نام نگهبان را وارد کنید.")
                 return
-            self.shifts.append({"time": datetime.now().isoformat(timespec="seconds"), "type": shift_type.get(), "name": guard, "note": note.get("1.0", "end").strip()})
+            self.shifts.append(
+                {
+                    "time": datetime.now().isoformat(timespec="seconds"),
+                    "type": shift_type.get(),
+                    "name": guard,
+                    "note": note.get("1.0", "end").strip(),
+                }
+            )
             self.save_data()
             name.delete(0, "end")
             note.delete("1.0", "end")
@@ -464,7 +732,17 @@ class GatekeeperApp:
             for item in tree.get_children():
                 tree.delete(item)
             for index, employee in enumerate(self.employees):
-                tree.insert("", "end", iid=str(index), values=(self.format_plate(employee["plate"]), employee["name"], employee["unit"], employee.get("car", "")))
+                tree.insert(
+                    "",
+                    "end",
+                    iid=str(index),
+                    values=(
+                        self.format_plate(employee["plate"]),
+                        employee["name"],
+                        employee["unit"],
+                        employee.get("car", ""),
+                    ),
+                )
 
         def selected_index():
             selection = tree.selection()
@@ -474,7 +752,9 @@ class GatekeeperApp:
             return int(selection[0])
 
         self.button(controls, "➕ افزودن کارمند", lambda: self.employee_form(refresh)).pack(side="right", padx=4)
-        self.button(controls, "✏️ ویرایش کارمند", lambda: self.employee_form(refresh, selected_index()), "#2196F3").pack(side="right", padx=4)
+        self.button(
+            controls, "✏️ ویرایش کارمند", lambda: self.employee_form(refresh, selected_index()), "#2196F3"
+        ).pack(side="right", padx=4)
 
         def delete():
             index = selected_index()
@@ -500,12 +780,12 @@ class GatekeeperApp:
         form.pack(fill="both", expand=True)
         existing = self.employees[index] if index is not None else {}
 
-        # --- پلاک به صورت ۴ فیلد ---
-        tk.Label(form, text="پلاک (مطابق فرمت ایرانی)", bg="#1e1e2f", fg="white", font=("Tahoma", 11)).pack(anchor="e", pady=(4, 0))
+        tk.Label(form, text="پلاک (مطابق فرمت ایرانی)", bg="#1e1e2f", fg="white", font=("Tahoma", 11)).pack(
+            anchor="e", pady=(4, 0)
+        )
         plate_frame = tk.Frame(form, bg="#1e1e2f")
         plate_frame.pack(fill="x", pady=3)
 
-        # از راست به چپ: ۲رقم | حرف | ۳رقم | ۲رقم
         part4 = tk.Entry(plate_frame, font=("Tahoma", 14), justify="center", width=3)
         part4.pack(side="right", ipady=5, padx=2)
         tk.Label(plate_frame, text="-", bg="#1e1e2f", fg="#888", font=("Tahoma", 12)).pack(side="right")
@@ -518,18 +798,15 @@ class GatekeeperApp:
         part1 = tk.Entry(plate_frame, font=("Tahoma", 14), justify="center", width=3)
         part1.pack(side="right", ipady=5, padx=2)
 
-        # پر کردن فیلدها در حالت ویرایش
         old_plate = existing.get("plate", "")
-        if len(old_plate) >= 8:  # فرمت بدون فاصله: ۲+۱+۳+۲
+        if len(old_plate) >= 8:
             part1.insert(0, old_plate[0:2])
             part2.insert(0, old_plate[2:3])
             part3.insert(0, old_plate[3:6])
             part4.insert(0, old_plate[6:8])
         elif old_plate:
-            # اگر فرمت قدیمی بود، کل را در فیلد اول بگذار
             part1.insert(0, old_plate)
 
-        # --- سایر فیلدها ---
         entries = {}
         for key, label in (("name", "نام و نام خانوادگی"), ("unit", "واحد"), ("car", "نوع ماشین (اختیاری)")):
             tk.Label(form, text=label, bg="#1e1e2f", fg="white", font=("Tahoma", 11)).pack(anchor="e", pady=(8, 0))
@@ -543,7 +820,6 @@ class GatekeeperApp:
             p2 = part2.get().strip()
             p3 = part3.get().strip()
             p4 = part4.get().strip()
-
             if not (p1 and p2 and p3 and p4):
                 messagebox.showwarning(APP_NAME, "لطفاً تمام بخش‌های پلاک را کامل وارد کنید.")
                 return
@@ -559,21 +835,19 @@ class GatekeeperApp:
             if len(p4) != 2 or not p4.isdigit():
                 messagebox.showwarning(APP_NAME, "فیلد چهارم پلاک باید دقیقاً ۲ رقم باشد.")
                 return
-
             plate = f"{p1}{p2}{p3}{p4}"
             name = entries["name"].get().strip()
             unit = entries["unit"].get().strip()
             car = entries["car"].get().strip()
-
             if not name or not unit:
                 messagebox.showwarning(APP_NAME, "نام و واحد الزامی است.")
                 return
-
-            duplicate = next((i for i, item in enumerate(self.employees) if item["plate"] == plate and i != index), None)
+            duplicate = next(
+                (i for i, item in enumerate(self.employees) if item["plate"] == plate and i != index), None
+            )
             if duplicate is not None:
                 messagebox.showwarning(APP_NAME, "این پلاک قبلاً ثبت شده است.")
                 return
-
             employee = {"plate": plate, "name": name, "unit": unit, "car": car}
             if index is None:
                 self.employees.append(employee)
@@ -588,16 +862,22 @@ class GatekeeperApp:
         part1.focus_set()
 
     def show_guest(self):
-        """ثبت مهمان با پلاک وارد شده در صفحه اصلی"""
         p1 = self.plate_part1.get().strip()
         p2 = self.plate_part2.get().strip()
         p3 = self.plate_part3.get().strip()
         p4 = self.plate_part4.get().strip()
-
         if not (p1 and p2 and p3 and p4):
             messagebox.showwarning(APP_NAME, "ابتدا پلاک را کامل وارد کنید.")
             return
-        if len(p1) != 2 or not p1.isdigit() or len(p2) != 1 or len(p3) != 3 or not p3.isdigit() or len(p4) != 2 or not p4.isdigit():
+        if (
+            len(p1) != 2
+            or not p1.isdigit()
+            or len(p2) != 1
+            or len(p3) != 3
+            or not p3.isdigit()
+            or len(p4) != 2
+            or not p4.isdigit()
+        ):
             messagebox.showwarning(APP_NAME, "پلاک را به درستی وارد کنید.")
             return
 
@@ -606,17 +886,17 @@ class GatekeeperApp:
 
         win = self.new_window("ثبت مهمان", "480x420")
         self.title_label(win, "👤 ثبت مهمان", 16).pack(pady=12)
-
         form = tk.Frame(win, bg="#1e1e2f", padx=30)
         form.pack(fill="both", expand=True)
-
-        tk.Label(form, text=f"پلاک: {display_plate}", bg="#1e1e2f", fg="#90caf9", font=("Tahoma", 13, "bold")).pack(anchor="e", pady=(0, 12))
-
+        tk.Label(
+            form, text=f"پلاک: {display_plate}", bg="#1e1e2f", fg="#90caf9", font=("Tahoma", 13, "bold")
+        ).pack(anchor="e", pady=(0, 12))
         tk.Label(form, text="فامیل", bg="#1e1e2f", fg="white", font=("Tahoma", 11)).pack(anchor="e")
         family = tk.Entry(form, font=("Tahoma", 12), justify="right")
         family.pack(fill="x", ipady=6, pady=4)
-
-        tk.Label(form, text="محل اعزام", bg="#1e1e2f", fg="white", font=("Tahoma", 11)).pack(anchor="e", pady=(10, 0))
+        tk.Label(form, text="محل اعزام", bg="#1e1e2f", fg="white", font=("Tahoma", 11)).pack(
+            anchor="e", pady=(10, 0)
+        )
         place = tk.Entry(form, font=("Tahoma", 12), justify="right")
         place.pack(fill="x", ipady=6, pady=4)
 
@@ -629,15 +909,15 @@ class GatekeeperApp:
             if not plc:
                 messagebox.showwarning(APP_NAME, "محل اعزام را وارد کنید.")
                 return
-
             name = f"{fam} (مهمان - {plc})"
             now = datetime.now().isoformat(timespec="seconds")
             log = {"time": now, "plate": plate, "name": name, "type": "مهمان", "action": action}
             self.logs.append(log)
             self.save_data()
             self.refresh_recent_logs()
-
-            text = f"👤 مهمان ثبت شد\nفامیل: {fam}\nمحل اعزام: {plc}\nپلاک: {display_plate}\nاقدام: {action}"
+            text = (
+                f"👤 مهمان ثبت شد\nفامیل: {fam}\nمحل اعزام: {plc}\nپلاک: {display_plate}\nاقدام: {action}"
+            )
             self.result_label.config(text=text, bg="#6a1b9a")
             self.clear_plate_fields()
             win.destroy()
@@ -645,9 +925,12 @@ class GatekeeperApp:
 
         btn_frame = tk.Frame(form, bg="#1e1e2f")
         btn_frame.pack(fill="x", pady=20)
-        self.button(btn_frame, "✅ ورود", lambda: save_guest("ورود"), "#4CAF50").pack(side="right", fill="x", expand=True, padx=(4, 0))
-        self.button(btn_frame, "🚪 خروج", lambda: save_guest("خروج"), "#f44336").pack(side="left", fill="x", expand=True, padx=(0, 4))
-
+        self.button(btn_frame, "✅ ورود", lambda: save_guest("ورود"), "#4CAF50").pack(
+            side="right", fill="x", expand=True, padx=(4, 0)
+        )
+        self.button(btn_frame, "🚪 خروج", lambda: save_guest("خروج"), "#f44336").pack(
+            side="left", fill="x", expand=True, padx=(0, 4)
+        )
         family.focus_set()
 
     def show_search(self):
@@ -668,9 +951,25 @@ class GatekeeperApp:
             if not q:
                 return
             for employee in self.employees:
-                text = " ".join([employee.get("plate", ""), employee.get("name", ""), employee.get("unit", ""), employee.get("car", "")]).casefold()
+                text = " ".join(
+                    [
+                        employee.get("plate", ""),
+                        employee.get("name", ""),
+                        employee.get("unit", ""),
+                        employee.get("car", ""),
+                    ]
+                ).casefold()
                 if q in text:
-                    tree.insert("", "end", values=(self.format_plate(employee["plate"]), employee["name"], employee["unit"], employee.get("car", "")))
+                    tree.insert(
+                        "",
+                        "end",
+                        values=(
+                            self.format_plate(employee["plate"]),
+                            employee["name"],
+                            employee["unit"],
+                            employee.get("car", ""),
+                        ),
+                    )
 
         self.button(form, "جستجو", search, "#2196F3").pack(side="left")
         query.bind("<Return>", lambda event: search())
