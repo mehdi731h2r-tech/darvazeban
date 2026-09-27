@@ -55,6 +55,45 @@ def gregorian_to_jalali(gy, gm, gd):
     return jy, jm, jd
 
 
+def jalali_to_gregorian(jy, jm, jd):
+    jy2 = jy - 979
+    jm2 = jm - 1
+    jd2 = jd - 1
+    j_day_no = 365 * jy2 + (jy2 // 33) * 8 + ((jy2 % 33) + 3) // 4
+    for i in range(jm2):
+        j_day_no += 31 if i < 6 else 30
+    j_day_no += jd2
+    g_day_no = j_day_no + 79
+    gy = 1600 + 400 * (g_day_no // 146097)
+    g_day_no %= 146097
+    leap = True
+    if g_day_no >= 36525:
+        g_day_no -= 1
+        gy += 100 * (g_day_no // 36524)
+        g_day_no %= 36524
+        if g_day_no >= 365:
+            g_day_no += 1
+        else:
+            leap = False
+    gy += 4 * (g_day_no // 1461)
+    g_day_no %= 1461
+    if g_day_no >= 366:
+        leap = False
+        g_day_no -= 1
+        gy += g_day_no // 365
+        g_day_no %= 365
+    gd = g_day_no + 1
+    sal_a = [0, 31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    gm = 1
+    for i in range(1, 13):
+        v = sal_a[i]
+        if gd <= v:
+            gm = i
+            break
+        gd -= v
+    return gy, gm, gd
+
+
 def format_jalali_datetime(dt=None):
     """تاریخ و ساعت شمسی به صورت خوانا"""
     if dt is None:
@@ -79,8 +118,12 @@ class GatekeeperApp:
         self.logs = []
         self.shifts = []
         self.password = DEFAULT_PASSWORD
+        self.section_passwords = {"employees": "", "shifts": "", "reports": "", "settings": "", "guest": ""}
+        self.section_locks = {"employees": True, "shifts": True, "reports": False, "settings": True, "guest": False}
+        self.time_offset_seconds = 0
+        self.use_custom_time = False
         self.selected_employee_index = None
-        self.admin_unlocked = False  # قفل بخش‌های حساس
+        self.unlocked_sections = set()
         self.clock_label = None
         self.load_data()
         self.configure_style()
@@ -92,6 +135,30 @@ class GatekeeperApp:
         style.configure("Treeview", font=("Tahoma", 10), rowheight=28)
         style.configure("Treeview.Heading", font=("Tahoma", 10, "bold"))
 
+    def now(self):
+        """زمان برنامه — مستقل و قابل تنظیم"""
+        t = datetime.now()
+        if self.use_custom_time:
+            t = t + timedelta(seconds=self.time_offset_seconds)
+        return t
+
+    def set_app_datetime(self, jy, jm, jd, hour, minute, second=0):
+        try:
+            gy, gm, gd = jalali_to_gregorian(int(jy), int(jm), int(jd))
+            desired = datetime(gy, gm, gd, int(hour), int(minute), int(second))
+            self.time_offset_seconds = int((desired - datetime.now()).total_seconds())
+            self.use_custom_time = True
+            self.save_data()
+            return True
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"تاریخ نامعتبر است:\n{exc}")
+            return False
+
+    def reset_app_time(self):
+        self.time_offset_seconds = 0
+        self.use_custom_time = False
+        self.save_data()
+
     def load_data(self):
         if not DATA_FILE.exists():
             return
@@ -101,6 +168,10 @@ class GatekeeperApp:
             self.logs = data.get("logs", [])
             self.shifts = data.get("shifts", [])
             self.password = data.get("password", DEFAULT_PASSWORD)
+            self.section_passwords = data.get("section_passwords", self.section_passwords)
+            self.section_locks = data.get("section_locks", self.section_locks)
+            self.time_offset_seconds = data.get("time_offset_seconds", 0)
+            self.use_custom_time = data.get("use_custom_time", False)
         except (OSError, json.JSONDecodeError):
             messagebox.showwarning(APP_NAME, "فایل اطلاعات خوانده نشد؛ برنامه با اطلاعات خالی باز شد.")
 
@@ -110,6 +181,10 @@ class GatekeeperApp:
             "logs": self.logs,
             "shifts": self.shifts,
             "password": self.password,
+            "section_passwords": self.section_passwords,
+            "section_locks": self.section_locks,
+            "time_offset_seconds": self.time_offset_seconds,
+            "use_custom_time": self.use_custom_time,
         }
         try:
             DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -154,54 +229,40 @@ class GatekeeperApp:
         if self.clock_label is None:
             return
         try:
-            self.clock_label.config(text=format_jalali_datetime())
+            mode = " (تنظیم‌شده)" if self.use_custom_time else ""
+            self.clock_label.config(text=format_jalali_datetime(self.now()) + mode)
             self._clock_job = self.root.after(1000, self._update_clock)
         except Exception:
             pass
 
-    # ---------- قفل رمز ----------
-    def ask_password(self, title="تأیید هویت"):
-        """درخواست رمز برای بخش‌های حساس"""
-        pwd = simpledialog.askstring(title, "رمز عبور را وارد کنید:", show="*", parent=self.root)
+    # ---------- قفل رمز بخش‌ها ----------
+    def _password_for_section(self, section):
+        p = self.section_passwords.get(section, "")
+        return p if p else self.password
+
+    def require_section(self, section, title=None):
+        if not self.section_locks.get(section, False):
+            return True
+        if section in self.unlocked_sections:
+            return True
+        name = title or section
+        pwd = simpledialog.askstring(f"قفل — {name}", f"رمز «{name}» را وارد کنید:", show="*", parent=self.root)
         if pwd is None:
             return False
-        if pwd == self.password:
-            self.admin_unlocked = True
+        if pwd == self._password_for_section(section):
+            self.unlocked_sections.add(section)
             return True
         messagebox.showerror(APP_NAME, "رمز عبور اشتباه است.")
         return False
 
-    def require_admin(self, action_name="این عملیات"):
-        """اگر قفل باشد، رمز بپرسد"""
-        if self.admin_unlocked:
-            return True
-        return self.ask_password(f"قفل — {action_name}")
-
-    def change_password(self):
-        if not self.require_admin("تغییر رمز"):
-            return
-        new1 = simpledialog.askstring("رمز جدید", "رمز جدید را وارد کنید:", show="*", parent=self.root)
-        if not new1:
-            return
-        new2 = simpledialog.askstring("تأیید رمز", "رمز جدید را دوباره وارد کنید:", show="*", parent=self.root)
-        if new1 != new2:
-            messagebox.showwarning(APP_NAME, "رمزها یکسان نیستند.")
-            return
-        if len(new1) < 4:
-            messagebox.showwarning(APP_NAME, "رمز باید حداقل ۴ کاراکتر باشد.")
-            return
-        self.password = new1
-        self.save_data()
-        messagebox.showinfo(APP_NAME, "رمز با موفقیت تغییر کرد.")
-
-    def lock_admin(self):
-        self.admin_unlocked = False
-        messagebox.showinfo(APP_NAME, "بخش‌های حساس قفل شد.")
+    def lock_all_sections(self):
+        self.unlocked_sections.clear()
+        messagebox.showinfo(APP_NAME, "همه بخش‌های قفل‌دار دوباره قفل شدند.")
 
     # ---------- ورود ----------
     def show_login(self):
         self.clear_window()
-        self.admin_unlocked = False
+        self.unlocked_sections.clear()
         frame = tk.Frame(self.root, bg="#1e1e2f", padx=60, pady=70)
         frame.place(relx=0.5, rely=0.5, anchor="center")
         self.title_label(frame, "🚪 دروازه‌بان", 24).pack(pady=(0, 8))
@@ -222,13 +283,13 @@ class GatekeeperApp:
 
     def login(self):
         if self.password_entry.get() == self.password:
-            self.admin_unlocked = False
+            self.unlocked_sections.clear()
             self.show_main()
         else:
             self.login_error.config(text="رمز عبور اشتباه است")
 
     def logout(self):
-        self.admin_unlocked = False
+        self.unlocked_sections.clear()
         self.show_login()
 
     # ---------- صفحه اصلی ----------
@@ -314,13 +375,13 @@ class GatekeeperApp:
         # نوار دکمه‌ها
         nav = tk.Frame(self.root, bg="#1e1e2f", padx=15, pady=10)
         nav.pack(fill="x")
-        self.button(nav, "📊 گزارش‌ها", self.show_report, "#2196F3").pack(side="right", padx=3)
+        self.button(nav, "📊 گزارش‌ها", lambda: self.require_section("reports", "گزارش‌ها") and self.show_report(), "#2196F3").pack(side="right", padx=3)
         self.button(nav, "🔄 تحویل / دریافت شیفت", self.show_shifts, "#ff9800").pack(side="right", padx=3)
         self.button(nav, "👥 مدیریت کارمندان", self._open_employees_locked, "#607d8b").pack(side="right", padx=3)
         self.button(nav, "🔍 جستجوی پیشرفته", self.show_search, "#607d8b").pack(side="right", padx=3)
-        self.button(nav, "👤 مهمان", self.show_guest, "#9c27b0").pack(side="right", padx=3)
-        self.button(nav, "🔐 تغییر رمز", self.change_password, "#795548").pack(side="right", padx=3)
-        self.button(nav, "🔒 قفل", self.lock_admin, "#455a64").pack(side="right", padx=3)
+        self.button(nav, "👤 مهمان", lambda: self.require_section("guest", "ثبت مهمان") and self.show_guest(), "#9c27b0").pack(side="right", padx=3)
+        self.button(nav, "⚙️ تنظیمات", self._open_settings, "#795548").pack(side="right", padx=3)
+        self.button(nav, "🔒 قفل همه", self.lock_all_sections, "#455a64").pack(side="right", padx=3)
         self.button(nav, "خروج", self.logout, "#f44336").pack(side="left", padx=3)
 
         self.result_label = tk.Label(
@@ -348,8 +409,12 @@ class GatekeeperApp:
         self.refresh_recent_logs()
 
     def _open_employees_locked(self):
-        if self.require_admin("مدیریت کارمندان"):
+        if self.require_section("employees", "مدیریت کارمندان"):
             self.show_employees()
+
+    def _open_settings(self):
+        if self.require_section("settings", "تنظیمات"):
+            self.show_settings()
 
     def make_tree(self, parent, columns, widths):
         frame = tk.Frame(parent)
@@ -515,7 +580,7 @@ class GatekeeperApp:
         is_entry = messagebox.askyesno("نوع حرکت", "این حرکت ورود است؟\n\nبله = ورود\nخیر = خروج")
         action = "ورود" if is_entry else "خروج"
         found = next((employee for employee in self.employees if employee["plate"] == plate), None)
-        now = datetime.now().isoformat(timespec="seconds")
+        now = self.now().isoformat(timespec="seconds")
         if found:
             text = (
                 f"✅ کارمند شرکت\nنام: {found['name']}\nواحد: {found['unit']}\n"
@@ -540,10 +605,94 @@ class GatekeeperApp:
         win.transient(self.root)
         return win
 
+
+    def show_settings(self):
+        win = self.new_window("تنظیمات", "640x700")
+        self.title_label(win, "⚙️ تنظیمات", 18).pack(pady=10)
+        form = tk.Frame(win, bg="#1e1e2f", padx=25)
+        form.pack(fill="both", expand=True)
+
+        tk.Label(form, text="📅 تاریخ و ساعت برنامه (شمسی — مستقل از ویندوز)", bg="#1e1e2f", fg="#90caf9",
+                 font=("Tahoma", 12, "bold")).pack(anchor="e", pady=(8, 4))
+        tk.Label(form, text="این زمان برای ثبت ورود/خروج استفاده می‌شود.", bg="#1e1e2f", fg="#aaa",
+                 font=("Tahoma", 9)).pack(anchor="e")
+
+        now = self.now()
+        jy, jm, jd = gregorian_to_jalali(now.year, now.month, now.day)
+        time_row = tk.Frame(form, bg="#1e1e2f")
+        time_row.pack(fill="x", pady=8)
+        fields = {}
+        for key, label, val, w in (("jy", "سال", jy, 5), ("jm", "ماه", jm, 3), ("jd", "روز", jd, 3),
+                                    ("h", "ساعت", now.hour, 3), ("m", "دقیقه", now.minute, 3), ("s", "ثانیه", now.second, 3)):
+            box = tk.Frame(time_row, bg="#1e1e2f")
+            box.pack(side="right", padx=4)
+            tk.Label(box, text=label, bg="#1e1e2f", fg="white", font=("Tahoma", 9)).pack()
+            e = tk.Entry(box, font=("Tahoma", 12), justify="center", width=w)
+            e.insert(0, str(val))
+            e.pack()
+            fields[key] = e
+
+        def apply_time():
+            if self.set_app_datetime(fields["jy"].get(), fields["jm"].get(), fields["jd"].get(),
+                                     fields["h"].get(), fields["m"].get(), fields["s"].get() or 0):
+                messagebox.showinfo(APP_NAME, "تاریخ و ساعت برنامه تنظیم شد.")
+
+        def sync_system():
+            self.reset_app_time()
+            messagebox.showinfo(APP_NAME, "ساعت برنامه با سیستم هماهنگ شد.")
+
+        btn_t = tk.Frame(form, bg="#1e1e2f")
+        btn_t.pack(fill="x", pady=6)
+        self.button(btn_t, "✓ اعمال تاریخ/ساعت", apply_time, "#4CAF50").pack(side="right", padx=4)
+        self.button(btn_t, "↺ همگام با سیستم", sync_system, "#607d8b").pack(side="right", padx=4)
+
+        tk.Label(form, text="🔑 رمز ورود به برنامه", bg="#1e1e2f", fg="#90caf9",
+                 font=("Tahoma", 12, "bold")).pack(anchor="e", pady=(16, 4))
+        login_pwd = tk.Entry(form, font=("Tahoma", 12), justify="right", show="*")
+        login_pwd.pack(fill="x", ipady=5)
+        login_pwd.insert(0, self.password)
+
+        tk.Label(form, text="🔐 رمز و قفل هر بخش", bg="#1e1e2f", fg="#90caf9",
+                 font=("Tahoma", 12, "bold")).pack(anchor="e", pady=(16, 4))
+        tk.Label(form, text="رمز خالی = رمز ورود. قفل روشن = قبل از باز شدن رمز می‌پرسد.",
+                 bg="#1e1e2f", fg="#aaa", font=("Tahoma", 9)).pack(anchor="e")
+
+        sections = [("employees", "مدیریت کارمندان"), ("shifts", "تحویل شیفت"),
+                    ("reports", "گزارش‌ها"), ("settings", "تنظیمات"), ("guest", "ثبت مهمان")]
+        lock_vars, pwd_entries = {}, {}
+        for key, title in sections:
+            row = tk.Frame(form, bg="#2a2a3d", padx=8, pady=5)
+            row.pack(fill="x", pady=2)
+            var = tk.BooleanVar(value=self.section_locks.get(key, False))
+            lock_vars[key] = var
+            tk.Checkbutton(row, text="قفل", variable=var, bg="#2a2a3d", fg="white",
+                           selectcolor="#333", activebackground="#2a2a3d", font=("Tahoma", 10)).pack(side="left")
+            e = tk.Entry(row, font=("Tahoma", 11), justify="right", show="*", width=14)
+            e.pack(side="left", padx=6, ipady=2)
+            e.insert(0, self.section_passwords.get(key, ""))
+            pwd_entries[key] = e
+            tk.Label(row, text=title, bg="#2a2a3d", fg="white", font=("Tahoma", 11)).pack(side="right")
+
+        def save_settings():
+            new_login = login_pwd.get().strip()
+            if len(new_login) < 4:
+                messagebox.showwarning(APP_NAME, "رمز ورود باید حداقل ۴ کاراکتر باشد.")
+                return
+            self.password = new_login
+            for key, _ in sections:
+                self.section_passwords[key] = pwd_entries[key].get().strip()
+                self.section_locks[key] = lock_vars[key].get()
+            self.save_data()
+            self.unlocked_sections.clear()
+            messagebox.showinfo(APP_NAME, "تنظیمات ذخیره شد.")
+            win.destroy()
+
+        self.button(form, "💾 ذخیره تنظیمات", save_settings, "#4CAF50").pack(fill="x", pady=16)
+
     # ---------- گزارش روزانه / ماهانه / سه‌ماهه ----------
     def _filter_logs(self, period):
         """period: day | month | quarter"""
-        now = datetime.now()
+        now = self.now()
         filtered = []
         for log in self.logs:
             try:
@@ -615,7 +764,7 @@ class GatekeeperApp:
             period_name = {"day": "روزانه", "month": "ماهانه", "quarter": "سه‌ماهه"}[period]
             summary_label.config(
                 text=(
-                    f"دوره: {period_name}  |  تاریخ شمسی: {format_jalali_date(datetime.now())}  |  "
+                    f"دوره: {period_name}  |  تاریخ شمسی: {format_jalali_date(self.now())}  |  "
                     f"کارمند ورود: {emp_in}  |  کارمند خروج: {emp_out}  |  مهمان: {guests}  |  غریبه: {strangers}"
                 )
             )
@@ -625,7 +774,7 @@ class GatekeeperApp:
         def copy_report():
             logs = getattr(win, "_current_logs", [])
             period_name = getattr(win, "_period_name", "")
-            lines = [f"گزارش {period_name} - {format_jalali_datetime()}", ""]
+            lines = [f"گزارش {period_name} - {format_jalali_datetime(self.now())}", ""]
             lines += [
                 f"{self.format_time(log['time'])} - {self.format_plate(log['plate'])} - "
                 f"{log['name']} ({log['type']} - {log['action']})"
@@ -639,7 +788,7 @@ class GatekeeperApp:
         def save_text():
             logs = getattr(win, "_current_logs", [])
             period_name = getattr(win, "_period_name", "")
-            lines = [f"گزارش {period_name} - {format_jalali_datetime()}", ""]
+            lines = [f"گزارش {period_name} - {format_jalali_datetime(self.now())}", ""]
             lines += [
                 f"{self.format_time(log['time'])} - {self.format_plate(log['plate'])} - "
                 f"{log['name']} ({log['type']} - {log['action']})"
@@ -660,7 +809,7 @@ class GatekeeperApp:
         refresh()
 
     def show_shifts(self):
-        if not self.require_admin("ثبت شیفت"):
+        if not self.require_section("shifts", "تحویل شیفت"):
             return
         win = self.new_window("تحویل / دریافت شیفت")
         self.title_label(win, "🔄 تحویل / دریافت شیفت", 18).pack(pady=12)
@@ -704,7 +853,7 @@ class GatekeeperApp:
                 return
             self.shifts.append(
                 {
-                    "time": datetime.now().isoformat(timespec="seconds"),
+                    "time": self.now().isoformat(timespec="seconds"),
                     "type": shift_type.get(),
                     "name": guard,
                     "note": note.get("1.0", "end").strip(),
@@ -910,7 +1059,7 @@ class GatekeeperApp:
                 messagebox.showwarning(APP_NAME, "محل اعزام را وارد کنید.")
                 return
             name = f"{fam} (مهمان - {plc})"
-            now = datetime.now().isoformat(timespec="seconds")
+            now = self.now().isoformat(timespec="seconds")
             log = {"time": now, "plate": plate, "name": name, "type": "مهمان", "action": action}
             self.logs.append(log)
             self.save_data()
